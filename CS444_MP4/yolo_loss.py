@@ -16,25 +16,23 @@ def compute_iou(box1, box2):
     M = box2.size(0)
 
     lt = torch.max(
-        box1[:, :2].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
-        box2[:, :2].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+        box1[:, :2].unsqueeze(1).expand(N, M, 2),
+        box2[:, :2].unsqueeze(0).expand(N, M, 2),
     )
-
     rb = torch.min(
-        box1[:, 2:].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
-        box2[:, 2:].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+        box1[:, 2:].unsqueeze(1).expand(N, M, 2),
+        box2[:, 2:].unsqueeze(0).expand(N, M, 2),
     )
 
-    wh = rb - lt  # [N,M,2]
-    wh[wh < 0] = 0  # clip at 0
-    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])  # [N,]
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])  # [M,]
-    area1 = area1.unsqueeze(1).expand_as(inter)  # [N,] -> [N,1] -> [N,M]
-    area2 = area2.unsqueeze(0).expand_as(inter)  # [M,] -> [1,M] -> [N,M]
-
-    iou = inter / (area1 + area2 - inter)
+    uheight = rb - lt  
+    uheight[uheight < 0] = 0  
+    inter = uheight[:, :, 0] * uheight[:, :, 1]  
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    area1 = area1.unsqueeze(1).expand_as(inter)
+    area2 = area2.unsqueeze(0).expand_as(inter)
+    union = area1 + area2 - inter
+    iou = inter /union
     return iou
 
 
@@ -99,17 +97,12 @@ class YoloLoss(nn.Module):
             target_xyxy = self.xywh2xyxy(box_target)  # (N*S*S, 4)
             iou = compute_iou(pred_xyxy, target_xyxy).diagonal().unsqueeze(1)  # (N*S*S, 1)
             ious.append(iou)
-
         ious = torch.cat(ious, dim=1)  # (N_obj, B)
-
-        # Find best IoU and corresponding box index
-        best_ious, best_idx = ious.max(dim=1)  # best_idx: which of B boxes has best IoU
-        best_ious = best_ious.unsqueeze(1)     # (N_obj, 1)
-        
-        stacked_preds = torch.stack(pred_box_list, dim=1)  # (N_obj, B, 5)
-
-        batch_indices = torch.arange(stacked_preds.size(0))
-        best_boxes = stacked_preds[batch_indices, best_idx]
+        best_ious, best_idx = ious.max(dim=1)  
+        best_ious = best_ious.unsqueeze(1)     
+        concat_pred = torch.stack(pred_box_list, dim=1)  
+        batchidx = torch.arange(concat_pred.size(0))
+        best_boxes = concat_pred[batchidx, best_idx]
         return best_ious, best_boxes
     def get_class_prediction_loss(self, classes_pred, classes_target, has_object_map):
         """
@@ -182,10 +175,10 @@ class YoloLoss(nn.Module):
         ### CODE
         # your code here
         xy_loss = F.mse_loss(box_pred_response[:, :2], box_target_response[:, :2], reduction='sum')
-        sqrt_wh_pred = torch.sqrt(box_pred_response[:, 2:].clamp(min=1e-6))
-        sqrt_wh_target = torch.sqrt(box_target_response[:, 2:])
-        wh_loss = F.mse_loss(sqrt_wh_pred, sqrt_wh_target, reduction='sum')
-        return self.l_coord * (xy_loss + wh_loss)
+        sqrt_pred = torch.sqrt(box_pred_response[:, 2:].clamp(min=1e-6))
+        sqrt_targ = torch.sqrt(box_target_response[:, 2:])
+        loss = F.mse_loss(sqrt_pred, sqrt_targ, reduction='sum')
+        return self.l_coord * (xy_loss + loss)
         # return reg_loss
 
     def forward(self, pred_tensor, target_boxes, target_cls, has_object_map):
@@ -226,34 +219,21 @@ class YoloLoss(nn.Module):
         # compute contain_object_loss
 
         # compute final loss
+        
         N = pred_tensor.size(0)
         pred_boxes_list = []
         for b in range(self.B):
-            pred_boxes_list.append(pred_tensor[..., b*5:(b*5+5)])  # Each: (N, S, S, 5)
-
+            pred_boxes_list.append(pred_tensor[..., b*5:(b*5+5)])
         pred_cls = pred_tensor[..., self.B * 5:]  # (N, S, S, 20)
-
-        target_boxes_obj = target_boxes[has_object_map]  # (N_obj, 4)
-        # Classification Loss
-
-        # No Object Loss
-
-        # Prepare object cells
-
-        pred_boxes_obj_list = [b[has_object_map] for b in pred_boxes_list]  # Each: (N_obj, 5)
-
-        # Best IOU + responsible box
+        target_boxes_obj = target_boxes[has_object_map]  
+        pred_boxes_obj_list = [b[has_object_map] for b in pred_boxes_list]
         best_ious, best_boxes = self.find_best_iou_boxes(pred_boxes_obj_list, target_boxes_obj)
 
         reg_loss = self.get_regression_loss(best_boxes[:, :4], target_boxes_obj)
-        contain_loss = self.get_contain_conf_loss(best_boxes[:, 4:5], best_ious.detach())  # stop gradient from GT iou
+        contain_loss = self.get_contain_conf_loss(best_boxes[:, 4:5], best_ious.detach())
         no_obj_loss = self.get_no_object_loss(pred_boxes_list, has_object_map)
         cls_loss = self.get_class_prediction_loss(pred_cls, target_cls, has_object_map)
-        # Regression Loss
 
-        # Confidence Loss (only responsible boxes)
-
-        # Combine
         total_loss = reg_loss + contain_loss + no_obj_loss + cls_loss
 
         loss_dict = dict(
