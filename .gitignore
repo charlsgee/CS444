@@ -1,4 +1,4 @@
 *.yml
 Miniconda3-latest-Linux-x86_64.sh
 ../data
-/VOC_DATA
+/CS444_MP4/VOC_DATA
